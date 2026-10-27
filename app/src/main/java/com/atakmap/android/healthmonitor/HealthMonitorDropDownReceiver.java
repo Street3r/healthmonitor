@@ -10,15 +10,10 @@ import android.bluetooth.BluetoothGattCharacteristic;
 import android.bluetooth.BluetoothGattDescriptor;
 import android.bluetooth.BluetoothGattService;
 import android.bluetooth.BluetoothManager;
-import android.bluetooth.le.BluetoothLeScanner;
-import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
-import android.content.IntentFilter;
 import android.content.SharedPreferences;
-import android.graphics.Color;
-import android.os.Handler;
-import android.os.IBinder;
+import android.os.SystemClock;
 import android.preference.PreferenceManager;
 import android.view.View;
 import android.widget.Button;
@@ -40,7 +35,6 @@ import com.atakmap.android.dropdown.DropDownReceiver;
 import com.atakmap.coremap.cot.event.CotEvent;
 import com.atakmap.coremap.log.Log;
 
-import java.util.List;
 import java.util.Locale;
 import java.util.Set;
 import java.util.UUID;
@@ -58,12 +52,15 @@ public class HealthMonitorDropDownReceiver extends DropDownReceiver implements
     private BluetoothGatt mBluetoothGatt;
     private BluetoothGattCharacteristic mBluetoothGattCharacteristic;
     public final BluetoothGattCallback mGattCallback;
-    private BroadcastReceiver gattUpdateReceiver;
     public static String HEART_RATE = "0000180d-0000-1000-8000-00805f9b34fb";
     public static String HEART_RATE_MEASUREMENT = "00002a37-0000-1000-8000-00805f9b34fb";
     public static String CLIENT_CHARACTERISTIC_CONFIG = "00002902-0000-1000-8000-00805f9b34fb";
 
     public TableLayout healthTable;
+
+    // Own position report with the heart rate is sent at most this often
+    private static final long DISPATCH_INTERVAL_MS = 30_000;
+    private long lastDispatch = 0;
 
 
     /**************************** CONSTRUCTOR *****************************/
@@ -84,18 +81,12 @@ public class HealthMonitorDropDownReceiver extends DropDownReceiver implements
         healthTable = templateView.findViewById(R.id.table);
         name = templateView.findViewById(R.id.name);
 
-        final int[] count = {0};
         this.mGattCallback = new BluetoothGattCallback() {
             @Override  // android.bluetooth.BluetoothGattCallback
             public void onCharacteristicChanged(BluetoothGatt arg2, BluetoothGattCharacteristic characteristic) {
-                int flag = characteristic.getProperties();
-                int format = -1;
-                if ((flag & 0x01) != 0) {
-                    format = BluetoothGattCharacteristic.FORMAT_UINT16;
-                } else {
-                    format = BluetoothGattCharacteristic.FORMAT_UINT8;
-                }
-                final int heartRate = characteristic.getIntValue(format, 1);
+                final int heartRate = parseHeartRate(characteristic.getValue());
+                if (heartRate < 0)
+                    return;
 
                 HealthMonitorLifecycle.getActivity().runOnUiThread(new Runnable() {
                     @Override
@@ -103,10 +94,15 @@ public class HealthMonitorDropDownReceiver extends DropDownReceiver implements
                         heartRateTV.setText(String.format(Locale.US, "%d bpm", heartRate));
                     }
                 });
-                if (count[0]++ % 15 == 0) {
-                    Marker self = getMapView().getSelfMarker();
-                    self.setMetaInteger("bpm", heartRate);
-                    self.setType("a-f-G-U-C-I-h-h");
+                Marker self = getMapView().getSelfMarker();
+                if (self == null)
+                    return;
+                self.setMetaInteger(HealthMonitorMapComponent.META_BPM, heartRate);
+                self.setMetaLong(HealthMonitorMapComponent.META_BPM_TIME, SystemClock.elapsedRealtime());
+
+                long now = SystemClock.elapsedRealtime();
+                if (lastDispatch == 0 || now - lastDispatch >= DISPATCH_INTERVAL_MS) {
+                    lastDispatch = now;
                     CotEvent saveMarker = CotEventFactory.createCotEvent(self);
                     CotMapComponent.getExternalDispatcher().dispatch(saveMarker);
                 }
@@ -130,6 +126,12 @@ public class HealthMonitorDropDownReceiver extends DropDownReceiver implements
                 Log.d(TAG, "onConnectionStateChange newState: " + arg7);
                if(arg7 == 0) {
                     Log.i(TAG, "Disconnected from GATT server.");
+                    // Stop sending the last reading; the user reconnects from the button
+                    Marker self = getMapView().getSelfMarker();
+                    if (self != null)
+                        self.removeMetaData(HealthMonitorMapComponent.META_BPM);
+                    lastDispatch = 0;
+                    closeGatt(arg5);
                     HealthMonitorLifecycle.getActivity().runOnUiThread(() -> {
                         scan.setBackgroundResource(R.color.red);
                         scan.setText("*NOT* Connected");
@@ -145,7 +147,7 @@ public class HealthMonitorDropDownReceiver extends DropDownReceiver implements
                        scan.setVisibility(View.VISIBLE);
                    });
 
-                   mBluetoothGatt.discoverServices();
+                   arg5.discoverServices();
                }
 
                 super.onConnectionStateChange(arg5, arg6, arg7);
@@ -158,15 +160,14 @@ public class HealthMonitorDropDownReceiver extends DropDownReceiver implements
 
             @Override  // android.bluetooth.BluetoothGattCallback
             public void onDescriptorWrite(BluetoothGatt arg3, BluetoothGattDescriptor arg4, int arg5) {
-                Intent i = new Intent("com.atakmap.app.civ.READ_HEART_RATE");
-                mapView.getContext().sendBroadcast(i);
+                Log.d(TAG, "onDescriptorWrite status: " + arg5);
             }
 
             @Override  // android.bluetooth.BluetoothGattCallback
             public void onMtuChanged(BluetoothGatt arg2, int arg3, int arg4) {
                 super.onMtuChanged(arg2, arg3, arg4);
                 if(arg4 == 0) {
-                    boolean v2 = mBluetoothGatt.discoverServices();
+                    boolean v2 = arg2.discoverServices();
                     Log.i(TAG, "5.0 attempting to start service discovery: " + v2);
                     return;
                 }
@@ -188,31 +189,26 @@ public class HealthMonitorDropDownReceiver extends DropDownReceiver implements
             public void onServicesDiscovered(BluetoothGatt arg3, int arg4) {
                 Log.w(TAG, "onServicesDiscovered received: " + arg4);
 
-                BluetoothGattService s = mBluetoothGatt.getService(UUID.fromString(HEART_RATE));
+                BluetoothGattService s = arg3.getService(UUID.fromString(HEART_RATE));
                 if (s == null) {
-                    mBluetoothGatt.disconnect();
+                    arg3.disconnect();
                     return;
                 }
                 mBluetoothGattCharacteristic = s.getCharacteristic(UUID.fromString(HEART_RATE_MEASUREMENT));
-                mBluetoothGatt.setCharacteristicNotification(mBluetoothGattCharacteristic, true);
-                BluetoothGattDescriptor d = mBluetoothGattCharacteristic.getDescriptor(UUID.fromString(CLIENT_CHARACTERISTIC_CONFIG));
-                d.setValue(BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE);
-                mBluetoothGatt.writeDescriptor(d);
-            }
-        };
-
-        gattUpdateReceiver = new BroadcastReceiver() {
-            @Override
-            public void onReceive(Context context, Intent intent) {
-                final String action = intent.getAction();
-                if (action.equals("com.atakmap.app.civ.READ_HEART_RATE")) {
-                    mBluetoothGatt.readCharacteristic(mBluetoothGattCharacteristic);
+                if (mBluetoothGattCharacteristic == null) {
+                    arg3.disconnect();
+                    return;
                 }
+                arg3.setCharacteristicNotification(mBluetoothGattCharacteristic, true);
+                BluetoothGattDescriptor d = mBluetoothGattCharacteristic.getDescriptor(UUID.fromString(CLIENT_CHARACTERISTIC_CONFIG));
+                if (d == null) {
+                    Log.w(TAG, "Heart rate characteristic has no CCC descriptor");
+                    return;
+                }
+                d.setValue(BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE);
+                arg3.writeDescriptor(d);
             }
         };
-        IntentFilter f = new IntentFilter();
-        f.addAction("com.atakmap.app.civ.READ_HEART_RATE");
-        mapView.getContext().registerReceiver(gattUpdateReceiver, f, Context.RECEIVER_EXPORTED);
 
         scan = templateView.findViewById(R.id.Scan);
 
@@ -240,14 +236,23 @@ public class HealthMonitorDropDownReceiver extends DropDownReceiver implements
             }
             */
 
+            if (!DeviceList.hasBluetoothPermission(mapView.getContext())) {
+                Toast.makeText(context, "ATAK has no Bluetooth permission (Nearby devices)", Toast.LENGTH_LONG).show();
+                return;
+            }
             BluetoothAdapter bluetoothAdapter = BluetoothAdapter.getDefaultAdapter();
+            if (bluetoothAdapter == null || !bluetoothAdapter.isEnabled()) {
+                Toast.makeText(context, "Bluetooth is off", Toast.LENGTH_LONG).show();
+                return;
+            }
 
             Set<BluetoothDevice> bluetoothDevices = bluetoothAdapter.getBondedDevices();
             for (BluetoothDevice device : bluetoothDevices) {
                 if (device.getName() != null) {
                    if (device.getAddress().equals(key)) {
+                       // A previous connection attempt may still hold a GATT client
+                       closeGatt();
                        mBluetoothGatt = device.connectGatt(mapView.getContext(), true, mGattCallback);
-                       mBluetoothGatt.connect();
                        HealthMonitorLifecycle.getActivity().runOnUiThread(() -> name.setText("Connected to: " + device.getName()));
                    }
                 }
@@ -258,7 +263,38 @@ public class HealthMonitorDropDownReceiver extends DropDownReceiver implements
     /**************************** PUBLIC METHODS *****************************/
 
     public void disposeImpl() {
-        getMapView().getContext().unregisterReceiver(gattUpdateReceiver);
+        closeGatt();
+    }
+
+    /**
+     * Parses a BLE Heart Rate Measurement (0x2A37). Bit 0 of the flags byte tells
+     * whether the value is UINT8 or UINT16 (little endian).
+     * @return heart rate in bpm, or -1 if the value is malformed
+     */
+    static int parseHeartRate(byte[] value) {
+        if (value == null || value.length < 2)
+            return -1;
+        if ((value[0] & 0x01) != 0) {
+            if (value.length < 3)
+                return -1;
+            return (value[1] & 0xFF) | ((value[2] & 0xFF) << 8);
+        }
+        return value[1] & 0xFF;
+    }
+
+    @SuppressLint("MissingPermission")
+    private synchronized void closeGatt() {
+        if (mBluetoothGatt != null) {
+            mBluetoothGatt.close();
+            mBluetoothGatt = null;
+        }
+    }
+
+    @SuppressLint("MissingPermission")
+    private synchronized void closeGatt(BluetoothGatt gatt) {
+        if (gatt == mBluetoothGatt)
+            mBluetoothGatt = null;
+        gatt.close();
     }
 
     /**************************** INHERITED METHODS *****************************/
