@@ -1,0 +1,13 @@
+# Local build configuration and signing keys
+local.properties
+*.jks
+*.keystore
+
+# Build output and IDE files
+.gradle/
+.idea/
+.takdev/
+build/
+app/build/
+*.iml
+.DS_Store
